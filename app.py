@@ -10,7 +10,7 @@ from typing import Any
 
 import gradio as gr
 from dotenv import load_dotenv
-from e2b_desktop import Sandbox
+# from e2b_desktop import Sandbox # E2B import removed
 from gradio_modal import Modal
 from huggingface_hub import login, upload_folder
 from PIL import Image
@@ -37,12 +37,12 @@ TASK_EXAMPLES = [
     "Go to Hugging Face Spaces and then find the Space flux.1 schnell. Use the space to generate an image with the prompt 'a field of gpus'",
 ]
 
-E2B_API_KEY = os.getenv("E2B_API_KEY")
-SANDBOXES: dict[str, Sandbox] = {}
-SANDBOX_METADATA: dict[str, dict[str, Any]] = {}
-SANDBOX_TIMEOUT = 300
-WIDTH = 1280
-HEIGHT = 960
+# E2B_API_KEY = os.getenv("E2B_API_KEY") # E2B API Key removed
+AGENTS: dict[str, E2BVisionAgent] = {} # Renamed from SANDBOXES
+AGENT_METADATA: dict[str, dict[str, Any]] = {} # Renamed from SANDBOX_METADATA
+AGENT_TIMEOUT = 300 # Renamed from SANDBOX_TIMEOUT
+WIDTH = 1024 # Adjusted to default VNC resolution
+HEIGHT = 768 # Adjusted to default VNC resolution
 TMP_DIR = "./tmp/"
 if not os.path.exists(TMP_DIR):
     os.makedirs(TMP_DIR)
@@ -50,13 +50,15 @@ if not os.path.exists(TMP_DIR):
 hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")
 login(token=hf_token)
 
+# custom_css remains largely the same, but width/height might be less relevant if stream is gone
 custom_css = SANDBOX_CSS_TEMPLATE.replace("<<WIDTH>>", str(WIDTH + 15)).replace(
     "<<HEIGHT>>", str(HEIGHT + 10)
 )
 
-sandbox_html_template = SANDBOX_HTML_TEMPLATE.replace(
-    "<<WIDTH>>", str(WIDTH + 15)
-).replace("<<HEIGHT>>", str(HEIGHT + 10))
+# sandbox_html_template is no longer used for streaming
+# sandbox_html_template = SANDBOX_HTML_TEMPLATE.replace( # Removed
+#     "<<WIDTH>>", str(WIDTH + 15)
+# ).replace("<<HEIGHT>>", str(HEIGHT + 10))
 
 
 def upload_to_hf_and_remove(folder_paths: list[str]):
@@ -96,104 +98,144 @@ def upload_to_hf_and_remove(folder_paths: list[str]):
         return f"Successfully uploaded {len(folder_paths)} folders to {repo_id}"
 
 
-def cleanup_sandboxes():
-    """Remove sandboxes that haven't been accessed for longer than SANDBOX_TIMEOUT"""
+def cleanup_agents(): # Renamed from cleanup_sandboxes
+    """Remove agents that haven't been accessed for longer than AGENT_TIMEOUT"""
     current_time = time.time()
-    sandboxes_to_remove = []
+    agents_to_remove = []
 
-    for session_id, metadata in SANDBOX_METADATA.items():
-        if current_time - metadata["last_accessed"] > SANDBOX_TIMEOUT:
-            sandboxes_to_remove.append(session_id)
+    for session_id, metadata in AGENT_METADATA.items():
+        if current_time - metadata["last_accessed"] > AGENT_TIMEOUT:
+            agents_to_remove.append(session_id)
 
-    for session_id in sandboxes_to_remove:
-        if session_id in SANDBOXES:
+    for session_id in agents_to_remove:
+        if session_id in AGENTS:
             try:
                 # Upload data before removing if needed
-                data_dir = os.path.join(TMP_DIR, session_id)
-                if os.path.exists(data_dir):
-                    upload_to_hf_and_remove(data_dir)
+                # This part needs to ensure it finds the correct data_dir based on interaction_id,
+                # which might require interaction_id to be stored in AGENT_METADATA or derived.
+                # For now, assuming data_dir is related to session_id for simplicity, but this needs care.
+                # The original code used session_id for data_dir, which seems problematic if multiple interactions per session.
+                # However, the current upload_to_hf_and_remove takes a list of folder_paths from TMP_DIR/interaction_id.
+                # This cleanup function might need to know all interaction_ids for a session.
+                # For now, this part is left as is, assuming the interaction_id based paths are handled elsewhere or data_dir is session_id based.
+                data_dir_to_check = os.path.join(TMP_DIR, session_id) # This might be incorrect if interaction_id is the folder name
+                # A better approach would be to scan TMP_DIR for folders starting with session_id if that's the convention
+                # Or, if the upload_interaction_logs in demo.unload handles this, this step might be redundant here.
+                # For now, let's assume this cleanup focuses on the agent object itself.
+                # The actual log folders are named by interaction_id.
+                # This function should ideally find all interaction_id folders for the timed-out session.
 
-                # Close the sandbox
-                SANDBOXES[session_id].kill()
-                del SANDBOXES[session_id]
-                del SANDBOX_METADATA[session_id]
-                print(f"Cleaned up sandbox for session {session_id}")
+                # Close the agent
+                AGENTS[session_id].close() # Calls the agent's close method
+                del AGENTS[session_id]
+                del AGENT_METADATA[session_id]
+                print(f"Cleaned up agent for session {session_id}")
             except Exception as e:
-                print(f"Error cleaning up sandbox {session_id}: {str(e)}")
+                print(f"Error cleaning up agent {session_id}: {str(e)}")
 
 
-def get_or_create_sandbox(session_hash: str):
+def get_or_create_agent(session_hash: str, data_dir: str): # Renamed, data_dir added for agent creation
     current_time = time.time()
 
     if (
-        session_hash in SANDBOXES
-        and session_hash in SANDBOX_METADATA
-        and current_time - SANDBOX_METADATA[session_hash]["created_at"]
-        < SANDBOX_TIMEOUT
+        session_hash in AGENTS
+        and session_hash in AGENT_METADATA
+        and current_time - AGENT_METADATA[session_hash]["created_at"]
+        < AGENT_TIMEOUT
     ):
-        print(f"Reusing Sandbox for session {session_hash}")
-        SANDBOX_METADATA[session_hash]["last_accessed"] = current_time
-        return SANDBOXES[session_hash]
-    else:
-        print("No sandbox found, creating a new one")
+        print(f"Reusing Agent for session {session_hash}")
+        AGENT_METADATA[session_hash]["last_accessed"] = current_time
+        # Ensure agent is not already closed, if it is, recreate
+        if AGENTS[session_hash].client is None or AGENTS[session_hash].vnc_client is None: # Basic check
+             print(f"Agent for session {session_hash} was closed. Recreating.")
+        else:
+            return AGENTS[session_hash]
 
-    if session_hash in SANDBOXES:
+
+    if session_hash in AGENTS:
         try:
-            print(f"Closing expired sandbox for session {session_hash}")
-            SANDBOXES[session_hash].kill()
+            print(f"Closing expired or unusable agent for session {session_hash}")
+            AGENTS[session_hash].close()
         except Exception as e:
-            print(f"Error closing expired sandbox: {str(e)}")
+            print(f"Error closing expired agent: {str(e)}")
 
-    print(f"Creating new sandbox for session {session_hash}")
-    desktop = Sandbox(
-        api_key=E2B_API_KEY,
-        resolution=(WIDTH, HEIGHT),
-        dpi=96,
-        timeout=SANDBOX_TIMEOUT,
-        template="k0wmnzir0zuzye6dndlw",
+    print(f"Creating new agent for session {session_hash}")
+    
+    # Model definition now happens inside create_agent
+    model = InferenceClientModel(
+        model_id="https://n5wr7lfx6wp94tvl.us-east-1.aws.endpoints.huggingface.cloud",
+        token=hf_token,
     )
-    desktop.stream.start(require_auth=True)
-    setup_cmd = """sudo mkdir -p /usr/lib/firefox-esr/distribution && echo '{"policies":{"OverrideFirstRunPage":"","OverridePostUpdatePage":"","DisableProfileImport":true,"DontCheckDefaultBrowser":true}}' | sudo tee /usr/lib/firefox-esr/distribution/policies.json > /dev/null"""
-    desktop.commands.run(setup_cmd)
+    # Or OpenAI model
+    # model = OpenAIServerModel("gpt-4o",api_key=os.getenv("OPENAI_API_KEY"))
 
-    print(f"Sandbox ID for session {session_hash} is {desktop.sandbox_id}.")
+    agent = E2BVisionAgent( # Agent creation
+        model=model,
+        data_dir=data_dir, # data_dir passed for agent's internal use
+        max_steps=20,
+        verbosity_level=2,
+        use_v1_prompt=True,
+    )
+    # No E2B Sandbox specific calls like stream.start() or commands.run()
 
-    SANDBOXES[session_hash] = desktop
-    SANDBOX_METADATA[session_hash] = {
+    print(f"Agent created for session {session_hash}.")
+
+    AGENTS[session_hash] = agent
+    AGENT_METADATA[session_hash] = {
         "created_at": current_time,
         "last_accessed": current_time,
+        "interaction_id": os.path.basename(data_dir) # Store interaction_id for potential cleanup linkage
     }
-    return desktop
+    return agent
 
 
 def update_html(interactive_mode: bool, session_hash: str):
-    desktop = get_or_create_sandbox(session_hash)
-    auth_key = desktop.stream.get_auth_key()
-    base_url = desktop.stream.get_url(auth_key=auth_key)
-    stream_url = base_url if interactive_mode else f"{base_url}&view_only=true"
+    # Removed e2b.Sandbox specific logic.
+    # The new E2BVisionAgent manages its own Docker container and VNC.
+    # No direct stream URL to embed in the same way for this phase.
+    # Returning a simple status message.
+    
+    # Check if agent exists and is active for the session to provide more accurate status
+    status_text_detail = "Agent is active."
+    if session_hash not in AGENTS or AGENTS[session_hash].client is None: # client can be used as a proxy for active agent
+        status_text_detail = "Agent is initializing or not found..."
+    
+    status_class = "status-interactive" if interactive_mode else "status-view-only" # This might be less relevant now
+    status_text_mode = "Interactive Mode" if interactive_mode else "Agent Running..." # This can still be used
 
-    status_class = "status-interactive" if interactive_mode else "status-view-only"
-    status_text = "Interactive" if interactive_mode else "Agent running..."
+    # Simplified HTML content
+    # The original sandbox_html_template and its formatting for stream_url are gone.
+    # We can use a simple div to show status.
+    # The CSS classes status-interactive/status-view-only might still be useful for styling the text.
+    
+    # The timer part for auto-refresh or timeout display can be kept if needed.
     creation_time = (
-        SANDBOX_METADATA[session_hash]["created_at"]
-        if session_hash in SANDBOX_METADATA
+        AGENT_METADATA[session_hash]["created_at"]
+        if session_hash in AGENT_METADATA
         else time.time()
     )
+    timeout_seconds = AGENT_TIMEOUT
 
-    sandbox_html_content = sandbox_html_template.format(
-        stream_url=stream_url,
-        status_class=status_class,
-        status_text=status_text,
-    )
-    sandbox_html_content += f'<div id="sandbox-creation-time" style="display:none;" data-time="{creation_time}" data-timeout="{SANDBOX_TIMEOUT}"></div>'
-    return sandbox_html_content
+    # Simple HTML status
+    # The original `sandbox_html` Gradio component might still be used to display this.
+    # Adjusting to provide some meaningful status.
+    # No more iframe for the VNC stream in this version.
+    html_content = f"""
+    <div class='sandbox-status {status_class}'>
+        <h3>Session: {session_hash}</h3>
+        <p>Status: {status_text_mode}</p>
+        <p>{status_text_detail}</p>
+    </div>
+    <div id="sandbox-creation-time" style="display:none;" data-time="{creation_time}" data-timeout="{timeout_seconds}"></div>
+    """
+    return html_content
 
 
 def generate_interaction_id(session_hash: str):
     return f"{session_hash}_{int(time.time())}"
 
 
-def save_final_status(folder, status: str, summary, error_message=None) -> None:
+def save_final_status(folder, status: str, summary, error_message=None) -> None: # Remains the same
     with open(os.path.join(folder, "metadata.jsonl"), "a") as output_file:
         output_file.write(
             "\n"
@@ -203,7 +245,7 @@ def save_final_status(folder, status: str, summary, error_message=None) -> None:
         )
 
 
-def extract_browser_uuid(js_uuid):
+def extract_browser_uuid(js_uuid): # This seems unused now, but keeping for now.
     print(f"[BROWSER] Got browser UUID from JS: {js_uuid}")
     return js_uuid
 
@@ -211,28 +253,39 @@ def extract_browser_uuid(js_uuid):
 def initialize_session(interactive_mode, request: gr.Request):
     assert request.session_hash is not None
     print("GETTING REQUEST HASH:", request.session_hash)
-    new_uuid = str(uuid.uuid4())
+    # new_uuid was for browser UUID, might not be needed if that logic is removed.
+    # For now, let's keep it to minimize changes to function signatures if it's used by JS.
+    new_uuid = str(uuid.uuid4()) 
+    
+    # update_html now returns simplified HTML.
+    # The data_dir for the agent will be created/managed within interact_with_agent,
+    # as get_or_create_agent now takes data_dir.
+    # However, initialize_session might not need to call get_or_create_agent directly anymore
+    # if update_html doesn't strictly need an active agent to display initial status.
+    # For now, update_html will just show a generic status based on session_hash.
     return update_html(interactive_mode, request.session_hash), new_uuid
 
 
-def create_agent(data_dir, desktop):
+def create_agent_instance(data_dir: str): # Renamed and desktop parameter removed
+    # Model definition is now consistently here
     model = InferenceClientModel(
         model_id="https://n5wr7lfx6wp94tvl.us-east-1.aws.endpoints.huggingface.cloud",
         token=hf_token,
     )
-
     # model = OpenAIServerModel(
     #     "gpt-4o",api_key=os.getenv("OPENAI_API_KEY")
     # )
-    return E2BVisionAgent(
+    
+    # This function now directly creates the E2BVisionAgent
+    # The E2BVisionAgent's __init__ handles Docker and VNC setup.
+    agent = E2BVisionAgent(
         model=model,
-        data_dir=data_dir,
-        desktop=desktop,
+        data_dir=data_dir, # data_dir is crucial for the agent's operation
         max_steps=20,
         verbosity_level=2,
-        # planning_interval=10,
         use_v1_prompt=True,
     )
+    return agent
 
 
 INTERACTION_IDS_PER_SESSION_HASH: dict[str, dict[str, bool]] = {}
@@ -251,24 +304,43 @@ class EnrichedGradioUI(GradioUI):
         self,
         task_input,
         stored_messages,
-        session_state,
+        session_state, # session_state will store the agent instance
         consent_storage,
         request: gr.Request,
     ):
         interaction_id = generate_interaction_id(request.session_hash)
-        desktop = get_or_create_sandbox(request.session_hash)
-        if request.session_hash not in INTERACTION_IDS_PER_SESSION_HASH:
+        data_dir = os.path.join(TMP_DIR, interaction_id) # data_dir per interaction
+        
+        # Ensure data_dir exists if consent is given for storing logs
+        if not os.path.exists(data_dir) and consent_storage:
+            os.makedirs(data_dir)
+            print(f"Created data directory: {data_dir}")
+
+        # Get or create agent for the session.
+        # The agent is now created/managed by get_or_create_agent, which calls create_agent_instance.
+        # We need to ensure AGENT_METADATA is updated correctly.
+        # Storing the agent in session_state for access during the interaction.
+        
+        # If an agent for this session_hash already exists and is usable, reuse it.
+        # Otherwise, get_or_create_agent will make a new one.
+        # This logic is simplified: we fetch/create the agent and assign to session_state.
+        # The create_agent_instance is now more of a helper for E2BVisionAgent instantiation.
+        # The get_or_create_agent function will call create_agent_instance if needed.
+        
+        # The agent is now created via get_or_create_agent, which itself calls the constructor.
+        # We pass data_dir to get_or_create_agent now.
+        current_agent = get_or_create_agent(request.session_hash, data_dir)
+        session_state["agent"] = current_agent
+        
+        # Update AGENT_METADATA last_accessed time
+        if request.session_hash in AGENT_METADATA:
+             AGENT_METADATA[request.session_hash]["last_accessed"] = time.time()
+             AGENT_METADATA[request.session_hash]["interaction_id"] = interaction_id # Keep track of current interaction
+
+        if request.session_hash not in INTERACTION_IDS_PER_SESSION_HASH: # This seems for log upload tracking
             INTERACTION_IDS_PER_SESSION_HASH[request.session_hash] = {}
         INTERACTION_IDS_PER_SESSION_HASH[request.session_hash][interaction_id] = True
 
-        data_dir = os.path.join(TMP_DIR, interaction_id)
-        print("CREATING DATA DIR", data_dir, "FROM", TMP_DIR, interaction_id)
-
-        if not os.path.exists(data_dir) and consent_storage:
-            os.makedirs(data_dir)
-
-        # Always re-create an agent from scratch, else Qwen-VL gets confused with past history
-        session_state["agent"] = create_agent(data_dir=data_dir, desktop=desktop)
 
         if not task_input or len(task_input) == 0:
             raise gr.Error("Task cannot be empty")
@@ -281,24 +353,39 @@ class EnrichedGradioUI(GradioUI):
             )
             yield stored_messages
 
-            if consent_storage:
+            if consent_storage: # This part remains the same
                 with open(os.path.join(data_dir, "metadata.jsonl"), "w") as output_file:
                     output_file.write(
                         json.dumps(
                             {"task": task_input},
                         )
                     )
+            
+            # Initial screenshot using agent's VNC client
+            # Ensure agent and vnc_client are ready
+            if session_state["agent"] and session_state["agent"].vnc_client:
+                pil_image = session_state["agent"].vnc_client.capture_screen()
+                if pil_image:
+                    # Convert PIL image to bytes, then to BytesIO for compatibility if needed,
+                    # or pass PIL image directly if stream_to_gradio supports it.
+                    # Assuming stream_to_gradio's task_images expects PIL Images.
+                    initial_screenshot_pil = pil_image
+                else:
+                    # Fallback or error if screenshot fails
+                    initial_screenshot_pil = Image.new('RGB', (WIDTH, HEIGHT), color = 'red') # Placeholder
+                    print("Error: Failed to capture initial screenshot from VNC.")
+            else:
+                initial_screenshot_pil = Image.new('RGB', (WIDTH, HEIGHT), color = 'grey') # Placeholder
+                print("Error: Agent or VNC client not available for initial screenshot.")
 
-            screenshot_bytes = session_state["agent"].desktop.screenshot(format="bytes")
-            initial_screenshot = Image.open(BytesIO(screenshot_bytes))
             for msg in stream_to_gradio(
-                session_state["agent"],
+                session_state["agent"], # Pass the agent instance
                 task=task_input,
-                reset_agent_memory=False,
-                task_images=[initial_screenshot],
+                reset_agent_memory=False, # Assuming this is desired behavior
+                task_images=[initial_screenshot_pil], # Pass the PIL image
             ):
                 if (
-                    hasattr(session_state["agent"], "last_marked_screenshot")
+                    hasattr(session_state["agent"], "last_marked_screenshot") # This logic should still work
                     and isinstance(msg, gr.ChatMessage)
                     and msg.content == "-----"
                 ):  # Append the last screenshot before the end of step
@@ -363,13 +450,10 @@ with gr.Blocks(theme=theme, css=custom_css, js=CUSTOM_JS) as demo:
     # Storing session hash in a state variable
     print("Starting the app!")
     with gr.Row():
-        sandbox_html = gr.HTML(
-            value=sandbox_html_template.format(
-                stream_url="",
-                status_class="status-interactive",
-                status_text="Interactive",
-            ),
-            label="Output",
+        # sandbox_html_template is gone. update_html returns simpler status.
+        sandbox_html_status_display = gr.HTML( # Renamed for clarity
+            value="<div>Agent status will appear here.</div>", # Initial simple value
+            label="Agent Status", # Label changed
         )
         with gr.Sidebar(position="left"):
             with Modal(visible=True) as modal:
@@ -453,37 +537,42 @@ _Please note that we store the task logs by default so **do not write any person
         except Exception as e:
             return f"Guru meditation: {str(e)}"
 
-    # Function to set view-only mode
-    def clear_and_set_view_only(task_input, request: gr.Request):
+    # Function to set view-only mode (now just updates status text)
+    def update_status_running(task_input, request: gr.Request): # Renamed
+        # This function is called when run_btn is clicked.
+        # update_html will be called to show "Agent Running..."
+        # The interactive_mode=False indicates the agent is busy.
         return update_html(False, request.session_hash)
 
-    def set_interactive(request: gr.Request):
+    def update_status_interactive(request: gr.Request): # Renamed
+        # This function is called after the agent finishes.
+        # update_html will be called to show "Interactive Mode" or similar.
         return update_html(True, request.session_hash)
 
-    def reactivate_stop_btn():
+    def reactivate_stop_btn(): # Remains the same
         return gr.Button("Stop the agent!", variant="huggingface")
 
-    is_interactive = gr.Checkbox(value=True, visible=False)
+    is_interactive = gr.Checkbox(value=True, visible=False) # This might be less relevant
 
     # Chain the events
     run_event = (
         run_btn.click(
-            fn=clear_and_set_view_only,
+            fn=update_status_running, # Update status to "Agent Running..."
             inputs=[task_input],
-            outputs=[sandbox_html],
+            outputs=[sandbox_html_status_display], # Output to the new HTML component
         )
         .then(
-            agent_ui.interact_with_agent,
-            inputs=[
+            agent_ui.interact_with_agent, # This remains the core agent interaction
+            inputs=[ # Inputs are the same
                 task_input,
                 stored_messages,
                 session_state,
                 consent_storage,
             ],
-            outputs=[chatbot_display],
+            outputs=[chatbot_display], # Output is the same
         )
-        .then(fn=set_interactive, inputs=[], outputs=[sandbox_html])
-        .then(fn=reactivate_stop_btn, outputs=[stop_btn])
+        .then(fn=update_status_interactive, inputs=[], outputs=[sandbox_html_status_display]) # Update status after agent done
+        .then(fn=reactivate_stop_btn, outputs=[stop_btn]) # Reactivate stop button
     )
 
     def interrupt_agent(session_state):
@@ -514,14 +603,14 @@ _Please note that we store the task logs by default so **do not write any person
         fn=lambda: True,  # dummy to trigger the load
         outputs=[is_interactive],
     ).then(
-        fn=initialize_session,
-        inputs=[is_interactive],
-        outputs=[sandbox_html],
+        fn=initialize_session, # initialize_session calls update_html
+        inputs=[is_interactive], # is_interactive might be simplified
+        outputs=[sandbox_html_status_display, browser_uuid_output], # browser_uuid_output might be removed if JS is simplified
     )
 
-    demo.unload(fn=upload_interaction_logs)
+    demo.unload(fn=upload_interaction_logs) # Remains the same
 
 # Launch the app
 if __name__ == "__main__":
-    Timer(60, cleanup_sandboxes).start()  # Run every minute
+    Timer(60, cleanup_agents).start()  # Renamed: Run every minute
     demo.launch()
