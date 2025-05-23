@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from gradio_modal import Modal
 from huggingface_hub import login, upload_folder
 from PIL import Image
-from smolagents import CodeAgent, InferenceClientModel
+from smolagents import CodeAgent, InferenceClientModel, OpenAIServerModel # Added OpenAIServerModel
 from smolagents.gradio_ui import GradioUI
 
 from e2bqwen import E2BVisionAgent, get_agent_summary_erase_images
@@ -268,14 +268,13 @@ def initialize_session(interactive_mode, request: gr.Request):
 
 def create_agent_instance(data_dir: str): # Renamed and desktop parameter removed
     # Model definition is now consistently here
-    model = InferenceClientModel(
-        model_id="https://n5wr7lfx6wp94tvl.us-east-1.aws.endpoints.huggingface.cloud",
-        token=hf_token,
+    # Using OpenAIServerModel as requested
+    model = OpenAIServerModel(
+        model_id="mlx-community/Qwen2.5-VL-32B-Instruct-4bit", # New model_id
+        base_url="http://localhost:1234/v1", # New base_url
+        api_key="lm-studio" # New api_key
+        # token parameter removed
     )
-    # model = OpenAIServerModel(
-    #     "gpt-4o",api_key=os.getenv("OPENAI_API_KEY")
-    # )
-    
     # This function now directly creates the E2BVisionAgent
     # The E2BVisionAgent's __init__ handles Docker and VNC setup.
     agent = E2BVisionAgent(
